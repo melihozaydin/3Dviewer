@@ -22,7 +22,8 @@ class ScanViewer {
 private:
     GLFWwindow* window;
     std::vector<Point3D> points;
-    std::vector<float> zMap;
+    std::vector<float> zMap;       // Current filtered Z map
+    std::vector<float> inputZMap;  // Original input Z map
     std::vector<float> filterParams;
     glm::mat4 projection, view, model;
     float zoom = 5.0f;
@@ -30,7 +31,7 @@ private:
     float panX = 0.0f, panY = 0.0f;
     float zMin = -1.0f, zMax = 1.0f;
     float zScale = 1.0f;
-    float filterCutoff = 0.0f;  // In micrometers
+    float filterLowCutoff = 0.0f, filterHighCutoff = 0.0f;  // Bandpass cutoffs in micrometers
     GLuint shaderProgram, vao, vbo;
     bool mouseDragging = false;
     bool panning = false;
@@ -41,6 +42,7 @@ private:
     std::string errorMessage;
     int colorLUT = 0;  // 0: Jet, 1: Viridis, 2: Plasma
     uint32_t width = 0, height = 0;
+    float inputZMin = -1.0f, inputZMax = 1.0f;
 
     const char* vertexShaderSource = R"(
         #version 330 core
@@ -99,7 +101,7 @@ private:
                 viewer->rotX += static_cast<float>(dy * 0.2);
             } else if (viewer->panning) {
                 viewer->panX += static_cast<float>(dx * 0.01);
-                viewer->panY -= static_cast<float>(dy * 0.01);  // Invert Y for natural panning
+                viewer->panY -= static_cast<float>(dy * 0.01);
             }
             viewer->lastX = xpos;
             viewer->lastY = ypos;
@@ -143,6 +145,7 @@ private:
         height = h;
         points.clear();
         zMap.resize(width * height);
+        inputZMap.resize(width * height);
         float xScale = 10.0f / width;
         float yScale = 10.0f / height;
         std::vector<char> scanline(TIFFScanlineSize(tif));
@@ -159,7 +162,7 @@ private:
             for (uint32_t x = 0; x < width; x++) {
                 float z;
                 if (bitsPerSample == 32 && sampleFormat == SAMPLEFORMAT_IEEEFP) {
-                    z = reinterpret_cast<float*>(scanline.data())[x];
+                    z = reinterpret_cast<float*>(scanline.data())[x] * 1000.0f;  // Scale μm to mm
                 } else if (bitsPerSample == 16 && sampleFormat == SAMPLEFORMAT_UINT) {
                     z = (reinterpret_cast<uint16_t*>(scanline.data())[x] / 65535.0f) * 2.0f - 1.0f;
                 } else if (bitsPerSample == 8 && sampleFormat == SAMPLEFORMAT_UINT) {
@@ -171,21 +174,37 @@ private:
                     TIFFClose(tif);
                     return false;
                 }
-                zMap[y * width + x] = z;
+                int idx = y * width + x;
+                inputZMap[idx] = z;
+                zMap[idx] = z;
                 zMinVal = std::min(zMinVal, z);
                 zMaxVal = std::max(zMaxVal, z);
             }
         }
 
-        applyFourierFilter();
+        // Initial render without filter
+        points.clear();
+        for (uint32_t y = 0; y < height; y++) {
+            for (uint32_t x = 0; x < width; x++) {
+                int idx = y * width + x;
+                float xPos = (x - width/2.0f) * xScale;
+                float yPos = (y - height/2.0f) * yScale;
+                points.push_back({xPos, yPos, zMap[idx]});
+            }
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
 
         TIFFClose(tif);
         currentDataSource = path;
+        inputZMin = zMinVal;
+        inputZMax = zMaxVal;
         zMin = zMinVal;
         zMax = zMaxVal;
-        filterCutoff = (zMax - zMin) / 2.0f;
+        filterLowCutoff = inputZMin / 1000.0f;  // Convert back to μm
+        filterHighCutoff = inputZMax / 1000.0f; // Convert back to μm
         errorMessage.clear();
-        std::cout << "Loaded TIFF: " << width << "x" << height << " (" << points.size() << " points)" << std::endl;
+        std::cout << "Loaded TIFF: " << width << "x" << height << " (" << points.size() << " points), Z range: " << zMinVal << " to " << zMaxVal << std::endl;
         return true;
     }
 
@@ -194,12 +213,14 @@ private:
         height = 101;
         points.clear();
         zMap.resize(width * height);
+        inputZMap.resize(width * height);
         for (int i = -50; i <= 50; i++) {
             for (int j = -50; j <= 50; j++) {
                 float x = i * 0.1f;
                 float y = j * 0.1f;
                 float z = sin(x) * cos(y) + sin(sqrt(x*x + y*y)) * 0.5f;
                 int idx = (i + 50) * width + (j + 50);
+                inputZMap[idx] = z;
                 zMap[idx] = z;
                 points.push_back({x, y, z});
             }
@@ -207,36 +228,43 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
         currentDataSource = "Generated sample data";
+        inputZMin = -1.0f;
+        inputZMax = 1.0f;
         zMin = -1.0f;
         zMax = 1.0f;
-        filterCutoff = (zMax - zMin) / 2.0f;
+        filterLowCutoff = inputZMin;
+        filterHighCutoff = inputZMax;
         errorMessage.clear();
     }
 
     void applyFourierFilter() {
-        if (zMap.empty() || width == 0 || height == 0) return;
+        if (inputZMap.empty() || width == 0 || height == 0) return;
 
         fftw_complex* in = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * width * height);
         fftw_complex* out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * width * height);
         fftw_plan forward = fftw_plan_dft_2d(height, width, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
         fftw_plan inverse = fftw_plan_dft_2d(height, width, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
 
-        for (size_t i = 0; i < zMap.size(); i++) {
-            in[i][0] = zMap[i];
+        for (size_t i = 0; i < inputZMap.size(); i++) {
+            in[i][0] = inputZMap[i];
             in[i][1] = 0.0;
         }
 
         fftw_execute(forward);
 
-        float pixelSize = 10.0f / std::max(width, height);
-        float cutoffFreq = 1.0f / (filterCutoff * 1e-6f);
+        float pixelSize = 10.0f / std::max(width, height);  // Physical size in mm
+        float lowFreq = 1.0f / (filterHighCutoff * 1e-6f);  // Lower frequency (higher period)
+        float highFreq = 1.0f / (filterLowCutoff * 1e-6f);  // Higher frequency (lower period)
+        if (lowFreq > highFreq) std::swap(lowFreq, highFreq);
+
         for (uint32_t y = 0; y < height; y++) {
             for (uint32_t x = 0; x < width; x++) {
                 int idx = y * width + x;
                 float fx = (x < width/2 ? x : x - width) / (width * pixelSize);
                 float fy = (y < height/2 ? y : y - height) / (height * pixelSize);
                 float freq = sqrt(fx * fx + fy * fy);
-                if (freq > cutoffFreq) {
+                // Always keep DC component (freq = 0) to preserve mean height
+                if (freq != 0 && (freq < lowFreq || freq > highFreq)) {
                     out[idx][0] = 0.0;
                     out[idx][1] = 0.0;
                 }
@@ -249,6 +277,8 @@ private:
         float xScale = 10.0f / width;
         float yScale = 10.0f / height;
         float norm = 1.0f / (width * height);
+        float zMinVal = std::numeric_limits<float>::max();
+        float zMaxVal = std::numeric_limits<float>::lowest();
         for (uint32_t y = 0; y < height; y++) {
             for (uint32_t x = 0; x < width; x++) {
                 int idx = y * width + x;
@@ -257,6 +287,8 @@ private:
                 float xPos = (x - width/2.0f) * xScale;
                 float yPos = (y - height/2.0f) * yScale;
                 points.push_back({xPos, yPos, z});
+                zMinVal = std::min(zMinVal, z);
+                zMaxVal = std::max(zMaxVal, z);
             }
         }
 
@@ -267,6 +299,9 @@ private:
         fftw_destroy_plan(inverse);
         fftw_free(in);
         fftw_free(out);
+
+        zMin = zMinVal;
+        zMax = zMaxVal;
     }
 
     void updateTiffFiles(const std::string& folderPath) {
@@ -415,8 +450,10 @@ public:
 
             if (currentItem == 0) {  // Controls panel
                 ImGui::SliderFloat("Z Scale", &zScale, 0.1f, 5.0f);
+                ImGui::SliderFloat("Z Min", &zMin, inputZMin, zMax);
+                ImGui::SliderFloat("Z Max", &zMax, zMin, inputZMax);
                 ImGui::Combo("Color LUT", &colorLUT, lutItems, IM_ARRAYSIZE(lutItems));
-                ImGui::SliderFloat("Filter Cutoff (μm)", &filterCutoff, zMin, zMax, "%.3f");
+                ImGui::SliderFloat2("Bandpass Filter (μm)", &filterLowCutoff, inputZMin/1000.0f, inputZMax/1000.0f, "%.3f");
                 if (ImGui::Button("Apply Filter")) {
                     applyFourierFilter();
                 }
@@ -461,7 +498,7 @@ public:
                 ImGui::BulletText("Browse and load TIFF files from a folder via GUI");
                 ImGui::BulletText("Interactive 3D view with mouse rotation (left-click), zoom (scroll), and pan (shift + left-click)");
                 ImGui::BulletText("Adjustable Z scaling and multiple color LUTs");
-                ImGui::BulletText("Fourier decomposition filter for low/high frequencies");
+                ImGui::BulletText("Bandpass Fourier filter for frequency decomposition");
                 ImGui::Text("Current data source: %s", currentDataSource.c_str());
                 if (!errorMessage.empty()) {
                     ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Error: %s", errorMessage.c_str());

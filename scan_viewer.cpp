@@ -12,6 +12,7 @@
 #include <tiffio.h>
 #include <dirent.h>
 #include <cstring>
+#include <fftw3.h>
 
 struct Point3D {
     float x, y, z;
@@ -21,20 +22,25 @@ class ScanViewer {
 private:
     GLFWwindow* window;
     std::vector<Point3D> points;
+    std::vector<float> zMap;
+    std::vector<float> filterParams;
     glm::mat4 projection, view, model;
     float zoom = 5.0f;
     float rotX = 0.0f, rotY = 0.0f;
     float panX = 0.0f, panY = 0.0f;
     float zMin = -1.0f, zMax = 1.0f;
     float zScale = 1.0f;
-    std::vector<float> filterParams;
+    float filterCutoff = 0.0f;  // In micrometers
     GLuint shaderProgram, vao, vbo;
     bool mouseDragging = false;
+    bool panning = false;
     double lastX = 0.0, lastY = 0.0;
     std::string currentDataSource = "Generated sample data";
     char folderPathBuffer[256] = "";
     std::vector<std::string> tiffFiles;
     std::string errorMessage;
+    int colorLUT = 0;  // 0: Jet, 1: Viridis, 2: Plasma
+    uint32_t width = 0, height = 0;
 
     const char* vertexShaderSource = R"(
         #version 330 core
@@ -43,12 +49,19 @@ private:
         uniform float zMin;
         uniform float zMax;
         uniform float zScale;
+        uniform int colorLUT;
         out vec3 vColor;
         void main() {
             vec3 scaledPos = vec3(aPos.x, aPos.y, aPos.z * zScale);
             gl_Position = mvp * vec4(scaledPos, 1.0);
             float t = clamp((scaledPos.z - zMin) / (zMax - zMin), 0.0, 1.0);
-            vColor = mix(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0), t);
+            if (colorLUT == 0) {  // Jet
+                vColor = mix(vec3(0,0,1), mix(vec3(0,1,1), mix(vec3(1,1,0), vec3(1,0,0), t), t), t);
+            } else if (colorLUT == 1) {  // Viridis
+                vColor = vec3(0.267*t + 0.043, 0.676*t + 0.141, 0.997*t + 0.278);
+            } else {  // Plasma
+                vColor = vec3(0.908*t + 0.051, 0.463*t + 0.281, 0.996*t + 0.133);
+            }
         }
     )";
 
@@ -64,20 +77,30 @@ private:
     static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
         ScanViewer* viewer = static_cast<ScanViewer*>(glfwGetWindowUserPointer(window));
         if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !ImGui::GetIO().WantCaptureMouse) {
-            viewer->mouseDragging = true;
+            if (mods & GLFW_MOD_SHIFT) {
+                viewer->panning = true;
+            } else {
+                viewer->mouseDragging = true;
+            }
             glfwGetCursorPos(window, &viewer->lastX, &viewer->lastY);
         } else if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
             viewer->mouseDragging = false;
+            viewer->panning = false;
         }
     }
 
     static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
         ScanViewer* viewer = static_cast<ScanViewer*>(glfwGetWindowUserPointer(window));
-        if (viewer->mouseDragging && !ImGui::GetIO().WantCaptureMouse) {
+        if (!ImGui::GetIO().WantCaptureMouse) {
             double dx = xpos - viewer->lastX;
             double dy = ypos - viewer->lastY;
-            viewer->rotY += static_cast<float>(dx * 0.2);
-            viewer->rotX += static_cast<float>(dy * 0.2);
+            if (viewer->mouseDragging) {
+                viewer->rotY += static_cast<float>(dx * 0.2);
+                viewer->rotX += static_cast<float>(dy * 0.2);
+            } else if (viewer->panning) {
+                viewer->panX += static_cast<float>(dx * 0.01);
+                viewer->panY -= static_cast<float>(dy * 0.01);  // Invert Y for natural panning
+            }
             viewer->lastX = xpos;
             viewer->lastY = ypos;
         }
@@ -98,30 +121,139 @@ private:
             return false;
         }
 
-        uint32_t width, height;
-        if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) || !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height)) {
-            errorMessage = "Failed to read TIFF dimensions: " + path;
+        uint32_t w, h;
+        uint16_t bitsPerSample, sampleFormat, samplesPerPixel;
+        if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w) || 
+            !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h) ||
+            !TIFFGetField(tif, TIFFTAG_BITSPERSAMPLE, &bitsPerSample) ||
+            !TIFFGetField(tif, TIFFTAG_SAMPLEFORMAT, &sampleFormat) ||
+            !TIFFGetField(tif, TIFFTAG_SAMPLESPERPIXEL, &samplesPerPixel)) {
+            errorMessage = "Failed to read TIFF metadata: " + path;
             TIFFClose(tif);
             return false;
         }
 
-        std::vector<uint16_t> buffer(width * height);
-        if (TIFFReadRGBAImage(tif, width, height, reinterpret_cast<uint32_t*>(buffer.data()), 0) == 0) {
-            errorMessage = "Failed to read TIFF data: " + path;
+        if (samplesPerPixel != 1) {
+            errorMessage = "Only single-channel TIFFs are supported: " + path;
             TIFFClose(tif);
             return false;
         }
+
+        width = w;
+        height = h;
+        points.clear();
+        zMap.resize(width * height);
+        float xScale = 10.0f / width;
+        float yScale = 10.0f / height;
+        std::vector<char> scanline(TIFFScanlineSize(tif));
+
+        float zMinVal = std::numeric_limits<float>::max();
+        float zMaxVal = std::numeric_limits<float>::lowest();
+
+        for (uint32_t y = 0; y < height; y++) {
+            if (TIFFReadScanline(tif, scanline.data(), y) < 0) {
+                errorMessage = "Failed to read scanline " + std::to_string(y) + " from: " + path;
+                TIFFClose(tif);
+                return false;
+            }
+            for (uint32_t x = 0; x < width; x++) {
+                float z;
+                if (bitsPerSample == 32 && sampleFormat == SAMPLEFORMAT_IEEEFP) {
+                    z = reinterpret_cast<float*>(scanline.data())[x];
+                } else if (bitsPerSample == 16 && sampleFormat == SAMPLEFORMAT_UINT) {
+                    z = (reinterpret_cast<uint16_t*>(scanline.data())[x] / 65535.0f) * 2.0f - 1.0f;
+                } else if (bitsPerSample == 8 && sampleFormat == SAMPLEFORMAT_UINT) {
+                    z = (reinterpret_cast<uint8_t*>(scanline.data())[x] / 255.0f) * 2.0f - 1.0f;
+                } else {
+                    errorMessage = "Unsupported TIFF format (" + 
+                                  std::to_string(bitsPerSample) + " bits, format " + 
+                                  std::to_string(sampleFormat) + "): " + path;
+                    TIFFClose(tif);
+                    return false;
+                }
+                zMap[y * width + x] = z;
+                zMinVal = std::min(zMinVal, z);
+                zMaxVal = std::max(zMaxVal, z);
+            }
+        }
+
+        applyFourierFilter();
+
+        TIFFClose(tif);
+        currentDataSource = path;
+        zMin = zMinVal;
+        zMax = zMaxVal;
+        filterCutoff = (zMax - zMin) / 2.0f;
+        errorMessage.clear();
+        std::cout << "Loaded TIFF: " << width << "x" << height << " (" << points.size() << " points)" << std::endl;
+        return true;
+    }
+
+    void loadDefaultData() {
+        width = 101;
+        height = 101;
+        points.clear();
+        zMap.resize(width * height);
+        for (int i = -50; i <= 50; i++) {
+            for (int j = -50; j <= 50; j++) {
+                float x = i * 0.1f;
+                float y = j * 0.1f;
+                float z = sin(x) * cos(y) + sin(sqrt(x*x + y*y)) * 0.5f;
+                int idx = (i + 50) * width + (j + 50);
+                zMap[idx] = z;
+                points.push_back({x, y, z});
+            }
+        }
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
+        currentDataSource = "Generated sample data";
+        zMin = -1.0f;
+        zMax = 1.0f;
+        filterCutoff = (zMax - zMin) / 2.0f;
+        errorMessage.clear();
+    }
+
+    void applyFourierFilter() {
+        if (zMap.empty() || width == 0 || height == 0) return;
+
+        fftw_complex* in = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * width * height);
+        fftw_complex* out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * width * height);
+        fftw_plan forward = fftw_plan_dft_2d(height, width, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+        fftw_plan inverse = fftw_plan_dft_2d(height, width, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+        for (size_t i = 0; i < zMap.size(); i++) {
+            in[i][0] = zMap[i];
+            in[i][1] = 0.0;
+        }
+
+        fftw_execute(forward);
+
+        float pixelSize = 10.0f / std::max(width, height);
+        float cutoffFreq = 1.0f / (filterCutoff * 1e-6f);
+        for (uint32_t y = 0; y < height; y++) {
+            for (uint32_t x = 0; x < width; x++) {
+                int idx = y * width + x;
+                float fx = (x < width/2 ? x : x - width) / (width * pixelSize);
+                float fy = (y < height/2 ? y : y - height) / (height * pixelSize);
+                float freq = sqrt(fx * fx + fy * fy);
+                if (freq > cutoffFreq) {
+                    out[idx][0] = 0.0;
+                    out[idx][1] = 0.0;
+                }
+            }
+        }
+
+        fftw_execute(inverse);
 
         points.clear();
         float xScale = 10.0f / width;
         float yScale = 10.0f / height;
-        float zScaleFactor = 2.0f / 65535.0f;
-
+        float norm = 1.0f / (width * height);
         for (uint32_t y = 0; y < height; y++) {
             for (uint32_t x = 0; x < width; x++) {
-                uint32_t idx = y * width + x;
-                uint16_t gray = buffer[idx] & 0xFFFF;
-                float z = (gray * zScaleFactor) - 1.0f;
+                int idx = y * width + x;
+                float z = in[idx][0] * norm;
+                zMap[idx] = z;
                 float xPos = (x - width/2.0f) * xScale;
                 float yPos = (y - height/2.0f) * yScale;
                 points.push_back({xPos, yPos, z});
@@ -131,29 +263,10 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
 
-        TIFFClose(tif);
-        currentDataSource = path;
-        zMin = -1.0f;
-        zMax = 1.0f;
-        errorMessage.clear();
-        std::cout << "Loaded TIFF: " << width << "x" << height << " (" << points.size() << " points)" << std::endl;
-        return true;
-    }
-
-    void loadDefaultData() {
-        points.clear();
-        for (int i = -50; i <= 50; i++) {
-            for (int j = -50; j <= 50; j++) {
-                float x = i * 0.1f;
-                float y = j * 0.1f;
-                float z = sin(x) * cos(y) + sin(sqrt(x*x + y*y)) * 0.5f;
-                points.push_back({x, y, z});
-            }
-        }
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
-        currentDataSource = "Generated sample data";
-        errorMessage.clear();
+        fftw_destroy_plan(forward);
+        fftw_destroy_plan(inverse);
+        fftw_free(in);
+        fftw_free(out);
     }
 
     void updateTiffFiles(const std::string& folderPath) {
@@ -286,6 +399,7 @@ public:
 
     void run() {
         const char* controlItems[] = {"Controls", "Data", "About"};
+        const char* lutItems[] = {"Jet", "Viridis", "Plasma"};
         int currentItem = 0;
         std::string selectedFolder;
 
@@ -300,26 +414,12 @@ public:
             ImGui::Combo("View", &currentItem, controlItems, IM_ARRAYSIZE(controlItems));
 
             if (currentItem == 0) {  // Controls panel
-                ImGui::SliderFloat("Z Min", &zMin, -2.0f, zMax);
-                ImGui::SliderFloat("Z Max", &zMax, zMin, 2.0f);
                 ImGui::SliderFloat("Z Scale", &zScale, 0.1f, 5.0f);
-                ImGui::SliderFloat("Zoom", &zoom, 1.0f, 20.0f);
-                ImGui::SliderFloat("Rotate X", &rotX, -180.0f, 180.0f);
-                ImGui::SliderFloat("Rotate Y", &rotY, -180.0f, 180.0f);
-                ImGui::SliderFloat("Pan X", &panX, -10.0f, 10.0f);
-                ImGui::SliderFloat("Pan Y", &panY, -10.0f, 10.0f);
-
-                if (ImGui::Button("Add Filter")) {
-                    filterParams.push_back(0.5f);
+                ImGui::Combo("Color LUT", &colorLUT, lutItems, IM_ARRAYSIZE(lutItems));
+                ImGui::SliderFloat("Filter Cutoff (μm)", &filterCutoff, zMin, zMax, "%.3f");
+                if (ImGui::Button("Apply Filter")) {
+                    applyFourierFilter();
                 }
-                for (size_t i = 0; i < filterParams.size(); i++) {
-                    std::string label = "Filter " + std::to_string(i);
-                    ImGui::SliderFloat(label.c_str(), &filterParams[i], 0.0f, 1.0f);
-                }
-
-                ImGui::Text("Camera Controls:");
-                ImGui::Text("- Left Click + Drag: Rotate");
-                ImGui::Text("- Scroll Wheel: Zoom");
             }
             else if (currentItem == 1) {  // Data panel
                 ImGui::InputText("Folder Path", folderPathBuffer, IM_ARRAYSIZE(folderPathBuffer));
@@ -341,7 +441,7 @@ public:
                         if (ImGui::Button(file.c_str())) {
                             std::string fullPath = selectedFolder + "/" + file;
                             if (!loadTiffZMap(fullPath)) {
-                                loadDefaultData();  // Revert to default on failure
+                                loadDefaultData();
                             }
                         }
                     }
@@ -359,9 +459,9 @@ public:
                 ImGui::Text("This program visualizes 3D point cloud data.");
                 ImGui::Text("Features:");
                 ImGui::BulletText("Browse and load TIFF files from a folder via GUI");
-                ImGui::BulletText("Interactive 3D view with rotation and zoom");
-                ImGui::BulletText("Adjustable Z scaling and color mapping");
-                ImGui::BulletText("Custom filters for data processing");
+                ImGui::BulletText("Interactive 3D view with mouse rotation (left-click), zoom (scroll), and pan (shift + left-click)");
+                ImGui::BulletText("Adjustable Z scaling and multiple color LUTs");
+                ImGui::BulletText("Fourier decomposition filter for low/high frequencies");
                 ImGui::Text("Current data source: %s", currentDataSource.c_str());
                 if (!errorMessage.empty()) {
                     ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Error: %s", errorMessage.c_str());
@@ -387,6 +487,7 @@ public:
             glUniform1f(glGetUniformLocation(shaderProgram, "zMin"), zMin);
             glUniform1f(glGetUniformLocation(shaderProgram, "zMax"), zMax);
             glUniform1f(glGetUniformLocation(shaderProgram, "zScale"), zScale);
+            glUniform1i(glGetUniformLocation(shaderProgram, "colorLUT"), colorLUT);
 
             glBindVertexArray(vao);
             glDrawArrays(GL_POINTS, 0, points.size());

@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     libxcursor-dev \
     libxi-dev \
     libtiff-dev \
+    libfftw3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,4 +24,4 @@ RUN g++ -o scan_viewer scan_viewer.cpp \
     imgui/backends/imgui_impl_glfw.cpp \
     imgui/backends/imgui_impl_opengl3.cpp \
     -Iimgui -Iimgui/backends \
-    -lGL -lGLEW -lglfw -ldl -pthread -ltiff
+    -lGL -lGLEW -lglfw -ldl -pthread -ltiff -lfftw3

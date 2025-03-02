@@ -13,6 +13,8 @@
 #include <dirent.h>
 #include <cstring>
 #include <fftw3.h>
+#include <algorithm>
+#include <limits>
 
 struct Point3D {
     float x, y, z;
@@ -23,13 +25,14 @@ private:
     GLFWwindow* window;
     std::vector<Point3D> points;
     std::vector<float> zMap;       // Current filtered Z map
-    std::vector<float> inputZMap;  // Original input Z map
+    std::vector<float> inputZMap;  // Original input Z map in normalized range
+    std::vector<float> rawZMap;    // Raw Z values from TIFF
     std::vector<float> filterParams;
     glm::mat4 projection, view, model;
     float zoom = 5.0f;
     float rotX = 0.0f, rotY = 0.0f;
     float panX = 0.0f, panY = 0.0f;
-    float zMin = -1.0f, zMax = 1.0f;
+    float zMin = 0.0f, zMax = 0.0f;  // Use raw Z range for coloring
     float zScale = 1.0f;
     float filterLowCutoff = 0.0f, filterHighCutoff = 0.0f;  // Bandpass cutoffs in micrometers
     GLuint shaderProgram, vao, vbo;
@@ -40,39 +43,55 @@ private:
     char folderPathBuffer[256] = "";
     std::vector<std::string> tiffFiles;
     std::string errorMessage;
-    int colorLUT = 0;  // 0: Jet, 1: Viridis, 2: Plasma
+    int colorLUT = 0;  // 0: Jet, 1: Viridis, 2: Plasma, 3: Hot, 4: Cool, 5: Turbo
     uint32_t width = 0, height = 0;
-    float inputZMin = -1.0f, inputZMax = 1.0f;
+    float inputZMin = -1.0f, inputZMax = 1.0f;  // Normalized range
+    float rawZMin = 0.0f, rawZMax = 0.0f;      // Original range
+    bool histogramNeedsUpdate = true;
 
     const char* vertexShaderSource = R"(
-        #version 330 core
-        layout(location = 0) in vec3 aPos;
+        #version 130
+        attribute vec3 aPos;
         uniform mat4 mvp;
         uniform float zMin;
         uniform float zMax;
         uniform float zScale;
         uniform int colorLUT;
-        out vec3 vColor;
+        varying vec3 vColor;
         void main() {
             vec3 scaledPos = vec3(aPos.x, aPos.y, aPos.z * zScale);
             gl_Position = mvp * vec4(scaledPos, 1.0);
-            float t = clamp((scaledPos.z - zMin) / (zMax - zMin), 0.0, 1.0);
-            if (colorLUT == 0) {  // Jet
-                vColor = mix(vec3(0,0,1), mix(vec3(0,1,1), mix(vec3(1,1,0), vec3(1,0,0), t), t), t);
-            } else if (colorLUT == 1) {  // Viridis
-                vColor = vec3(0.267*t + 0.043, 0.676*t + 0.141, 0.997*t + 0.278);
-            } else {  // Plasma
+            float t = clamp((aPos.z - zMin) / (zMax - zMin), 0.0, 1.0);
+            if (colorLUT == 0) {  // Jet (more gradations)
+                if (t < 0.25) vColor = mix(vec3(0,0,1), vec3(0,0.5,1), t/0.25);
+                else if (t < 0.5) vColor = mix(vec3(0,0.5,1), vec3(0,1,1), (t-0.25)/0.25);
+                else if (t < 0.75) vColor = mix(vec3(0,1,1), vec3(1,1,0), (t-0.5)/0.25);
+                else vColor = mix(vec3(1,1,0), vec3(1,0,0), (t-0.75)/0.25);
+            } else if (colorLUT == 1) {  // Viridis (more gradations)
+                if (t < 0.33) vColor = mix(vec3(0.267,0.676,0.997), vec3(0.043,0.141,0.278), t/0.33);
+                else if (t < 0.66) vColor = mix(vec3(0.043,0.141,0.278), vec3(0.5,0.5,0.5), (t-0.33)/0.33);
+                else vColor = mix(vec3(0.5,0.5,0.5), vec3(1,0.9,0), (t-0.66)/0.34);
+            } else if (colorLUT == 2) {  // Plasma
                 vColor = vec3(0.908*t + 0.051, 0.463*t + 0.281, 0.996*t + 0.133);
+            } else if (colorLUT == 3) {  // Hot
+                vColor = vec3(3.0*t, t > 0.33 ? 3.0*(t-0.33) : 0.0, t > 0.66 ? 3.0*(t-0.66) : 0.0);
+            } else if (colorLUT == 4) {  // Cool
+                vColor = vec3(t, 1.0-t, 1.0);
+            } else {  // Turbo
+                float r = 0.1357 + t * (4.5970 - t * (42.8537 - t * (151.0138 - t * (218.7175 - t * 115.2778))));
+                float g = 0.0914 + t * (2.1855 + t * (4.2596 - t * (71.3487 - t * (206.5138 - t * 165.4033))));
+                float b = 0.1066 + t * (5.9399 - t * (49.9290 - t * (171.2617 - t * (258.5662 - t * 136.5015))));
+                vColor = vec3(r, g, b);
             }
+            vColor = clamp(vColor, 0.0, 1.0);
         }
     )";
 
     const char* fragmentShaderSource = R"(
-        #version 330 core
-        in vec3 vColor;
-        out vec4 FragColor;
+        #version 130
+        varying vec3 vColor;
         void main() {
-            FragColor = vec4(vColor, 1.0);
+            gl_FragColor = vec4(vColor, 1.0);
         }
     )";
 
@@ -146,6 +165,7 @@ private:
         points.clear();
         zMap.resize(width * height);
         inputZMap.resize(width * height);
+        rawZMap.resize(width * height);
         float xScale = 10.0f / width;
         float yScale = 10.0f / height;
         std::vector<char> scanline(TIFFScanlineSize(tif));
@@ -162,7 +182,7 @@ private:
             for (uint32_t x = 0; x < width; x++) {
                 float z;
                 if (bitsPerSample == 32 && sampleFormat == SAMPLEFORMAT_IEEEFP) {
-                    z = reinterpret_cast<float*>(scanline.data())[x] * 1000.0f;  // Scale μm to mm
+                    z = reinterpret_cast<float*>(scanline.data())[x];  // Raw μm
                 } else if (bitsPerSample == 16 && sampleFormat == SAMPLEFORMAT_UINT) {
                     z = (reinterpret_cast<uint16_t*>(scanline.data())[x] / 65535.0f) * 2.0f - 1.0f;
                 } else if (bitsPerSample == 8 && sampleFormat == SAMPLEFORMAT_UINT) {
@@ -175,36 +195,52 @@ private:
                     return false;
                 }
                 int idx = y * width + x;
-                inputZMap[idx] = z;
-                zMap[idx] = z;
+                rawZMap[idx] = z;
                 zMinVal = std::min(zMinVal, z);
                 zMaxVal = std::max(zMaxVal, z);
             }
         }
 
-        // Initial render without filter
+        // Normalize Z to -1 to 1 range for rendering only
+        float zRange = zMaxVal - zMinVal;
+        if (zRange > 0) {
+            for (size_t i = 0; i < rawZMap.size(); i++) {
+                inputZMap[i] = 2.0f * (rawZMap[i] - zMinVal) / zRange - 1.0f;
+                zMap[i] = rawZMap[i];  // Start with raw values for filtering
+            }
+        } else {
+            inputZMap = rawZMap;
+            zMap = rawZMap;
+        }
+
         points.clear();
         for (uint32_t y = 0; y < height; y++) {
             for (uint32_t x = 0; x < width; x++) {
                 int idx = y * width + x;
                 float xPos = (x - width/2.0f) * xScale;
                 float yPos = (y - height/2.0f) * yScale;
-                points.push_back({xPos, yPos, zMap[idx]});
+                points.push_back({xPos, yPos, rawZMap[idx]});
             }
         }
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cerr << "OpenGL error after loading TIFF: " << err << std::endl;
+        }
 
         TIFFClose(tif);
         currentDataSource = path;
-        inputZMin = zMinVal;
-        inputZMax = zMaxVal;
-        zMin = zMinVal;
-        zMax = zMaxVal;
-        filterLowCutoff = inputZMin / 1000.0f;  // Convert back to μm
-        filterHighCutoff = inputZMax / 1000.0f; // Convert back to μm
+        inputZMin = -1.0f;
+        inputZMax = 1.0f;
+        rawZMin = zMinVal;
+        rawZMax = zMaxVal;
+        zMin = rawZMin;
+        zMax = rawZMax;
+        filterLowCutoff = rawZMin;
+        filterHighCutoff = rawZMax;
         errorMessage.clear();
-        std::cout << "Loaded TIFF: " << width << "x" << height << " (" << points.size() << " points), Z range: " << zMinVal << " to " << zMaxVal << std::endl;
+        std::cout << "Loaded TIFF: " << width << "x" << height << " (" << points.size() << " points), Raw Z range: " << zMinVal << " to " << zMaxVal << std::endl;
         return true;
     }
 
@@ -214,57 +250,71 @@ private:
         points.clear();
         zMap.resize(width * height);
         inputZMap.resize(width * height);
+        rawZMap.resize(width * height);
         for (int i = -50; i <= 50; i++) {
             for (int j = -50; j <= 50; j++) {
                 float x = i * 0.1f;
                 float y = j * 0.1f;
                 float z = sin(x) * cos(y) + sin(sqrt(x*x + y*y)) * 0.5f;
                 int idx = (i + 50) * width + (j + 50);
-                inputZMap[idx] = z;
+                rawZMap[idx] = z;
+                inputZMap[idx] = z;  
                 zMap[idx] = z;
                 points.push_back({x, y, z});
             }
         }
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cerr << "OpenGL error after loading default data: " << err << std::endl;
+        }
         currentDataSource = "Generated sample data";
         inputZMin = -1.0f;
         inputZMax = 1.0f;
-        zMin = -1.0f;
-        zMax = 1.0f;
-        filterLowCutoff = inputZMin;
-        filterHighCutoff = inputZMax;
+        rawZMin = -1.0f;
+        rawZMax = 1.0f;
+        zMin = rawZMin;
+        zMax = rawZMax;
+        filterLowCutoff = rawZMin;
+        filterHighCutoff = rawZMax;
         errorMessage.clear();
     }
 
     void applyFourierFilter() {
-        if (inputZMap.empty() || width == 0 || height == 0) return;
+        if (rawZMap.empty() || width == 0 || height == 0) return;
 
         fftw_complex* in = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * width * height);
         fftw_complex* out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * width * height);
         fftw_plan forward = fftw_plan_dft_2d(height, width, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
         fftw_plan inverse = fftw_plan_dft_2d(height, width, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
 
-        for (size_t i = 0; i < inputZMap.size(); i++) {
-            in[i][0] = inputZMap[i];
+        for (size_t i = 0; i < rawZMap.size(); i++) {
+            in[i][0] = rawZMap[i];
             in[i][1] = 0.0;
         }
 
         fftw_execute(forward);
 
-        float pixelSize = 10.0f / std::max(width, height);  // Physical size in mm
-        float lowFreq = 1.0f / (filterHighCutoff * 1e-6f);  // Lower frequency (higher period)
-        float highFreq = 1.0f / (filterLowCutoff * 1e-6f);  // Higher frequency (lower period)
-        if (lowFreq > highFreq) std::swap(lowFreq, highFreq);
+        // Use spatial frequency based on physical size
+        float pixelSize = 10.0f / std::max(width, height);  // Assuming 10 units across the image
+        float filterLowFreq = filterLowCutoff / (pixelSize * 1e6f);  // Convert μm to cycles/unit
+        float filterHighFreq = filterHighCutoff / (pixelSize * 1e6f);  // Convert μm to cycles/unit
+        if (filterLowFreq > filterHighFreq) std::swap(filterLowFreq, filterHighFreq);
+
+        float nyquist = 0.5f;  // Nyquist frequency (max freq = 0.5 cycles/pixel)
+        float lowCutoffFreq = filterLowFreq * pixelSize;  // Scale to normalized frequency
+        float highCutoffFreq = filterHighFreq * pixelSize;
+        lowCutoffFreq = std::max(0.0f, std::min(lowCutoffFreq, nyquist));
+        highCutoffFreq = std::max(0.0f, std::min(highCutoffFreq, nyquist));
 
         for (uint32_t y = 0; y < height; y++) {
             for (uint32_t x = 0; x < width; x++) {
                 int idx = y * width + x;
-                float fx = (x < width/2 ? x : x - width) / (width * pixelSize);
-                float fy = (y < height/2 ? y : y - height) / (height * pixelSize);
+                float fx = (x < width/2 ? x : x - width) / (float)width;
+                float fy = (y < height/2 ? y : y - height) / (float)height;
                 float freq = sqrt(fx * fx + fy * fy);
-                // Always keep DC component (freq = 0) to preserve mean height
-                if (freq != 0 && (freq < lowFreq || freq > highFreq)) {
+                if (freq < lowCutoffFreq || freq > highCutoffFreq) {
                     out[idx][0] = 0.0;
                     out[idx][1] = 0.0;
                 }
@@ -283,6 +333,7 @@ private:
             for (uint32_t x = 0; x < width; x++) {
                 int idx = y * width + x;
                 float z = in[idx][0] * norm;
+                z = std::max(-FLT_MAX/2.0f, std::min(z, FLT_MAX/2.0f));  // Clamp to prevent overflow
                 zMap[idx] = z;
                 float xPos = (x - width/2.0f) * xScale;
                 float yPos = (y - height/2.0f) * yScale;
@@ -294,6 +345,10 @@ private:
 
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cerr << "OpenGL error after applying filter: " << err << std::endl;
+        }
 
         fftw_destroy_plan(forward);
         fftw_destroy_plan(inverse);
@@ -302,6 +357,7 @@ private:
 
         zMin = zMinVal;
         zMax = zMaxVal;
+        histogramNeedsUpdate = true;
     }
 
     void updateTiffFiles(const std::string& folderPath) {
@@ -333,8 +389,8 @@ public:
         }
 
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_ANY_PROFILE);
 
         window = glfwCreateWindow(1280, 720, "3D Scan Viewer", NULL, NULL);
         if (!window) {
@@ -361,7 +417,7 @@ public:
         ImGuiIO& io = ImGui::GetIO();
         (void)io;
 
-        if (!ImGui_ImplGlfw_InitForOpenGL(window, true) || !ImGui_ImplOpenGL3_Init("#version 330")) {
+        if (!ImGui_ImplGlfw_InitForOpenGL(window, true) || !ImGui_ImplOpenGL3_Init("#version 130")) {
             std::cerr << "Failed to initialize ImGui" << std::endl;
             glfwDestroyWindow(window);
             glfwTerminate();
@@ -369,6 +425,13 @@ public:
         }
 
         shaderProgram = createShaderProgram();
+        if (shaderProgram == 0) {
+            std::cerr << "Failed to create shader program" << std::endl;
+            glfwDestroyWindow(window);
+            glfwTerminate();
+            exit(EXIT_FAILURE);
+        }
+
         loadDefaultData();
 
         glGenVertexArrays(1, &vao);
@@ -378,6 +441,10 @@ public:
         glBufferData(GL_ARRAY_BUFFER, points.size() * sizeof(Point3D), points.data(), GL_STATIC_DRAW);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Point3D), (void*)0);
         glEnableVertexAttribArray(0);
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cerr << "OpenGL error during initialization: " << err << std::endl;
+        }
 
         filterParams.push_back(0.5f);
         glPointSize(2.0f);
@@ -404,6 +471,7 @@ public:
             char infoLog[512];
             glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
             std::cerr << "Vertex shader compilation failed: " << infoLog << std::endl;
+            return 0;
         }
 
         GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
@@ -414,6 +482,8 @@ public:
             char infoLog[512];
             glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
             std::cerr << "Fragment shader compilation failed: " << infoLog << std::endl;
+            glDeleteShader(vertexShader);
+            return 0;
         }
 
         GLuint program = glCreateProgram();
@@ -425,6 +495,9 @@ public:
             char infoLog[512];
             glGetProgramInfoLog(program, 512, NULL, infoLog);
             std::cerr << "Shader program linking failed: " << infoLog << std::endl;
+            glDeleteShader(vertexShader);
+            glDeleteShader(fragmentShader);
+            return 0;
         }
 
         glDeleteShader(vertexShader);
@@ -434,7 +507,7 @@ public:
 
     void run() {
         const char* controlItems[] = {"Controls", "Data", "About"};
-        const char* lutItems[] = {"Jet", "Viridis", "Plasma"};
+        const char* lutItems[] = {"Jet", "Viridis", "Plasma", "Hot", "Cool", "Turbo"};
         int currentItem = 0;
         std::string selectedFolder;
 
@@ -449,13 +522,29 @@ public:
             ImGui::Combo("View", &currentItem, controlItems, IM_ARRAYSIZE(controlItems));
 
             if (currentItem == 0) {  // Controls panel
-                ImGui::SliderFloat("Z Scale", &zScale, 0.1f, 5.0f);
-                ImGui::SliderFloat("Z Min", &zMin, inputZMin, zMax);
-                ImGui::SliderFloat("Z Max", &zMax, zMin, inputZMax);
+                ImGui::SliderFloat("Z Scale", &zScale, 0.001f, 100.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Z Min", &zMin, rawZMin, zMax);
+                ImGui::SliderFloat("Z Max", &zMax, zMin, rawZMax);
                 ImGui::Combo("Color LUT", &colorLUT, lutItems, IM_ARRAYSIZE(lutItems));
-                ImGui::SliderFloat2("Bandpass Filter (μm)", &filterLowCutoff, inputZMin/1000.0f, inputZMax/1000.0f, "%.3f");
-                if (ImGui::Button("Apply Filter")) {
-                    applyFourierFilter();
+                if (ImGui::CollapsingHeader("Histogram")) {
+                    if (!rawZMap.empty()) {
+                        const int bins = 100;
+                        std::vector<float> hist(bins, 0.0f);
+                        float binWidth = (rawZMax - rawZMin) / bins;
+                        for (float z : rawZMap) {
+                            int bin = std::min(static_cast<int>((z - rawZMin) / binWidth), bins - 1);
+                            if (bin >= 0 && bin < bins) hist[bin]++;
+                        }
+                        float maxCount = *std::max_element(hist.begin(), hist.end());
+                        if (maxCount > 0) {
+                            for (float& count : hist) count /= maxCount;  // Normalize to 0-1
+                        }
+                        ImGui::PlotHistogram("Z Histogram", hist.data(), bins, 0, nullptr, 0.0f, 1.0f, ImVec2(0, 100));
+                        ImGui::SliderFloat2("Filter Range (μm)", &filterLowCutoff, rawZMin, rawZMax, "%.3f");
+                        if (ImGui::IsItemEdited()) {
+                            applyFourierFilter();
+                        }
+                    }
                 }
             }
             else if (currentItem == 1) {  // Data panel
@@ -498,7 +587,8 @@ public:
                 ImGui::BulletText("Browse and load TIFF files from a folder via GUI");
                 ImGui::BulletText("Interactive 3D view with mouse rotation (left-click), zoom (scroll), and pan (shift + left-click)");
                 ImGui::BulletText("Adjustable Z scaling and multiple color LUTs");
-                ImGui::BulletText("Bandpass Fourier filter for frequency decomposition");
+                ImGui::BulletText("Bandpass Fourier filter via histogram");
+                ImGui::BulletText("Collapsible histogram of Z values");
                 ImGui::Text("Current data source: %s", currentDataSource.c_str());
                 if (!errorMessage.empty()) {
                     ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Error: %s", errorMessage.c_str());
@@ -528,6 +618,10 @@ public:
 
             glBindVertexArray(vao);
             glDrawArrays(GL_POINTS, 0, points.size());
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR) {
+                std::cerr << "OpenGL error after rendering: " << err << std::endl;
+            }
 
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

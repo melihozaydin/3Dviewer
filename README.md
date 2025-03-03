@@ -1,6 +1,4 @@
 # 3D Scan Viewer
-
-# add image here
 ![3D Scan Viewer](Assets/Screenshot.png)
 
 ## Overview

@@ -1,5 +1,8 @@
 # 3D Scan Viewer
 
+# add image here
+![3D Scan Viewer](Assets/Screenshot.png)
+
 ## Overview
 
 The 3D Scan Viewer is a graphical application designed to visualize 3D point cloud data. It supports loading and displaying point cloud data from TIFF files, applying Fourier filters, and interacting with the 3D view using mouse controls. The application uses OpenGL for rendering and ImGui for the graphical user interface.
